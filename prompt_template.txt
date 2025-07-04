@@ -16,11 +16,14 @@ You are a world-class, meticulous data validation engineer. Your only task is to
 3.  **NO INDIVIDUAL TYPE CHECKING**: You MUST NOT generate `expect_column_values_to_be_of_type` for any individual column. The overall object schema validation will handle primary type checking.
 4.  **NULLABLE COLUMNS IN JSON SCHEMA**: For properties in the `json_schema` that are nullable, ensure their type includes `"null"` (e.g., `{{"type": ["string", "null"]}}`).
 5.  **ALLOWED VALUES**:
-    - For **string columns** with 'Allowed Values' (e.g., "delivery" || "pickup"), you MUST use `expect_column_values_to_be_in_set`. The `value_set` kwarg must contain all allowed string values as a list.
-    - For **numeric columns** (integer, float, double types) with general 'Allowed Values' (i.e., *not* a strictly defined small range or specific set of allowed values), you MUST NOT check for specific `value_set`. Instead, generate `expect_column_values_to_match_regex` to verify a numeric format:
-        - For integer-like columns: `"regex": "^\\d+$"` (checks for positive whole numbers as strings)
-        - For float/double-like columns: `"regex": "^[-+]?\\d*\\.?\\d+$"` (handles decimals and optional sign, as strings)
-    - **EXCEPTION for Numeric Columns**: If the business specification explicitly states a **limited and specific set of allowed numeric values or a small numeric range** (e.g., "only 0-10", "can only be 0 or 1"), then you MUST use `expect_column_values_to_be_in_set` for that specific numeric column, with the exact numeric values in the `value_set`.
+    - **FOR INDEX FIELDS (i.e., any field whose name contains 'index', 'total_item', or 'total_ad_item'): You MUST NOT check for specific value sets (e.g., '0,1', '0-10'). Instead, generate `expect_column_values_to_match_regex` to verify a generic numeric format:**
+        - For integer-like index columns: `"regex": "^\\d+$"` (checks for positive whole numbers as strings)
+        - For float/double-like index columns: `"regex": "^[-+]?\\d*\\.?\\d+$"` (handles decimals and optional sign, as strings)
+    - For **all other non-index string columns** with 'Allowed Values' (e.g., "delivery" || "pickup"), you MUST use `expect_column_values_to_be_in_set`. The `value_set` kwarg must contain all allowed string values as a list.
+    - For **all other non-index numeric columns** (integer, float, double types) with general 'Allowed Values' (i.e., *not* a strictly defined small range or specific set of allowed values), you MUST NOT check for specific `value_set`. Instead, generate `expect_column_values_to_match_regex` to verify a numeric format:
+        - For integer-like columns: `"regex": "^\\d+$"`
+        - For float/double-like columns: `"regex": "^[-+]?\\d*\\.?\\d+$"`
+    - **EXCEPTION for Non-Index Numeric Columns**: If the business specification explicitly states a **limited and specific set of allowed numeric values or a small numeric range** (e.g., "only 0-10", "can only be 0 or 1") for a **non-index numeric column**, then you MUST use `expect_column_values_to_be_in_set` for that specific numeric column, with the exact numeric values in the `value_set`.
     - If there is an original `row_condition` for these allowed values (string or numeric), that `row_condition` must be included, adhering to the atomic `row_condition` rule (Rule 2).
     - **NUMERIC VALUE SET ADJUSTMENT (If Type Errors Recur for `expect_column_values_to_be_in_set`)**: If `expect_column_values_to_be_in_set` for numeric columns causes type errors, represent integer values as floats in the `value_set` (e.g., `[0.0, 1.0]` instead of `[0, 1]`).
 6.  **MANDATORY STRING FIELD VALUES**: For any mandatory field (marked 'Y') that is a string type, its value MUST NOT be an empty string (`''`). Generate `expect_column_values_to_not_match_regex` with `regex": "^$"`.
