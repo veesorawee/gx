@@ -128,6 +128,8 @@ def run_validation_process(sql_input, expectations_input, suite_name, db_config,
     trino_host, trino_port, trino_username, trino_password = db_config
     db_query_date, SEGMENT_BY_COLUMNS = val_params
 
+    context = gx.get_context(project_root_dir=os.getcwd())
+
     with st.status("🚀 Starting Validation Process...", expanded=True) as status:
         run_name = f"run_{suite_name}_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}"
         status.write(f"**Run Name:** `{run_name}` | **Suite:** `{suite_name}`")
@@ -245,7 +247,15 @@ def run_validation_process(sql_input, expectations_input, suite_name, db_config,
             status.update(label="Error", state="error"); st.error("No valid batches were created."); return None, None
         
         status.write("**4. 🏁 Running final Great Expectations checkpoint...**")
-        checkpoint = context.add_or_update_checkpoint(name=f"checkpoint_{run_name}", run_name_template=run_name)
+        checkpoint = context.add_or_update_checkpoint(
+            name=f"checkpoint_{run_name}",
+            run_name_template=run_name,
+            action_list=[
+                {"name": "store_validation_result", "action": {"class_name": "StoreValidationResultAction"}},
+                {"name": "store_evaluation_params", "action": {"class_name": "StoreEvaluationParametersAction"}},
+                {"name": "update_data_docs", "action": {"class_name": "UpdateDataDocsAction"}},
+            ]
+        )
         checkpoint_result = checkpoint.run(validations=validations_to_run)
         
         status.update(label="✅ **Validation Process Complete!**", state="complete", expanded=False)
