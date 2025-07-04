@@ -1,0 +1,7 @@
+streamlit
+pandas
+great-expectations
+google-generativeai
+python-dotenv
+sqlalchemy
+trino
