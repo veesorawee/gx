@@ -1,0 +1,20 @@
+# Environment variables
+.env
+
+# Great Expectations temporary files
+great_expectations/uncommitted/
+gx/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# IDE / OS specific
+.idea/
+.vscode/
+.DS_Store
+
+# Virtual environment
+.venv/
+venv/
+env/

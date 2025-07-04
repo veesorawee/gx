@@ -1,0 +1,9 @@
+SELECT
+    os_name,
+    app_ver,
+    screen_name,
+    event,
+    screen,
+    exp
+FROM
+    iu.lineman.{table_name}
