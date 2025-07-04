@@ -208,7 +208,6 @@ def run_validation_process(sql_input, expectations_input, suite_name, db_config,
                 df = pd.read_sql(text(final_query), engine)
                 if df.empty: status.write(f"&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;- No data. Skipping.", unsafe_allow_html=True); continue
                 
-                # ▼▼▼ START OF CORRECTED LOGIC ▼▼▼
                 # 1. Standardize object columns to string first.
                 for col_name in object_columns:
                     if col_name in df.columns: df[col_name] = df[col_name].apply(lambda x: json.dumps(x) if x is not None else None)
@@ -231,7 +230,6 @@ def run_validation_process(sql_input, expectations_input, suite_name, db_config,
                 validator = context.get_validator(batch_request=batch_request, expectation_suite_name=suite_name)
                 for exp_config in expectations_list:
                     getattr(validator, exp_config['expectation_type'])(**exp_config["kwargs"])
-                # ▲▲▲ END OF CORRECTED LOGIC ▲▲▲
                 
                 validator.save_expectation_suite(discard_failed_expectations=False)
                 validations_to_run.append({"batch_request": batch_request, "expectation_suite_name": suite_name})
@@ -418,7 +416,6 @@ with automate_tab:
 
     st.markdown("---")
     if st.button("🚀 Generate & Start Validation (Automate)", type="primary"):
-        # ▼▼▼ START OF MODIFICATION: Reordered workflow with SQL Test ▼▼▼
         final_sql_input = ""
         suite_name_prefix = "auto"
         
