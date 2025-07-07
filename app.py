@@ -13,12 +13,15 @@ import re
 import traceback
 import google.generativeai as genai
 import webbrowser
+import time
 
 # --- 0. App Configuration & Setup ---
 SQL_DIR = "sql"
 EXPECTATIONS_DIR = "expectations"
+LOGS_DIR = "logs"
 os.makedirs(SQL_DIR, exist_ok=True)
 os.makedirs(EXPECTATIONS_DIR, exist_ok=True)
+os.makedirs(LOGS_DIR, exist_ok=True)
 
 load_dotenv()
 
@@ -32,6 +35,11 @@ if api_key:
         GEMINI_AVAILABLE = False
 
 # --- 1. Helper Functions ---
+def clear_logs():
+    """Removes all files from the logs directory."""
+    for file in glob.glob(os.path.join(LOGS_DIR, "*")):
+        os.remove(file)
+        
 def list_files(directory, extension):
     return [os.path.basename(f) for f in glob.glob(os.path.join(directory, f"*.{extension}"))]
 
@@ -47,35 +55,50 @@ def flatten_json_columns(df: pd.DataFrame, flatten_map: dict) -> pd.DataFrame:
             df[f'{parent_col}_{key}'] = df[parent_col].apply(safe_get_from_json_string, key=key)
     return df
 
-def generate_automated_sql(screen_name: str, app_type: str, event_type: str, event_category: str, target: str) -> str:
-    """Generates SQL with a dynamic WHERE clause based on event_type."""
+def parse_select_columns(sql_string: str) -> list[str]:
+    """Parses a SQL string to extract column names from the main SELECT clause."""
+    try:
+        match = re.search(r'SELECT(.*?)FROM', sql_string, re.IGNORECASE | re.DOTALL)
+        if not match: return []
+        columns_str = match.group(1).replace('\n', ' ').replace('\r', '')
+        columns = [col.strip().split(' as ')[-1].strip() for col in columns_str.split(',')]
+        return [col for col in columns if col]
+    except Exception:
+        return []
+
+def generate_automated_sql(screen_name: str, app_type: str, event_type: str, event_category: str, target: str, segment_columns: list) -> str:
+    """Generates SQL, ensuring segmentation columns are present in the SELECT clause."""
     table_name_middle = f"_{app_type}" if app_type == "web" else ""
     table_name = f"jitsu_lm_user{table_name_middle}_{event_type}"
     
     try:
         with open("sql_template.txt", "r", encoding="utf-8") as f:
-            base_query_template = f.read()
+            template = f.read()
     except FileNotFoundError:
         st.error("File not found: 'sql_template.txt'. Please create it first.")
         st.stop()
-
-    # Step 1: Fill in the table name from the template
-    base_query = base_query_template.format(table_name=table_name)
+        
+    # Check if segmentation columns are in the template, add them if not.
+    existing_columns = parse_select_columns(template)
+    missing_segment_cols = [col for col in segment_columns if col not in existing_columns]
     
-    # Step 2: Build the WHERE clause dynamically
-    where_clauses = [f"dt = '{{dt}}'"] # Keep dt as a placeholder for the main process
-    if screen_name:
-        where_clauses.append(f"screen_name = '{screen_name}'")
+    if missing_segment_cols:
+        st.info(f"Adding missing segment columns to SELECT clause: {missing_segment_cols}")
+        cols_to_add = ", ".join(missing_segment_cols) + ", "
+        # Add the columns right after the SELECT keyword
+        template = re.sub(r'SELECT\s+', f'SELECT {cols_to_add}', template, count=1, flags=re.IGNORECASE)
 
+    where_clauses = [f"dt = '{{dt}}'"]
+    if screen_name: where_clauses.append(f"screen_name = '{screen_name}'")
     if event_type in ["click", "impression"]:
         if event_category: where_clauses.append(f"event_category = '{event_category}'")
         if target: where_clauses.append(f"target = '{target}'")
     elif event_type == "custom":
         if event_category: where_clauses.append(f"event_category = '{event_category}'")
     
-    # Step 3: Combine base query with the dynamic WHERE clause
-    final_template = f"{base_query} WHERE {' AND '.join(where_clauses)} {{extra_where_conditions}}"
-    return final_template
+    base_query = template.format(table_name=table_name)
+    query = f"{base_query} WHERE {' AND '.join(where_clauses)} {{extra_where_conditions}}"
+    return query
 
 def display_validation_errors(checkpoint_result):
     failed_results_list = []
@@ -354,7 +377,9 @@ with manual_tab:
 
 
             st.header("📊 Final Validation Results")
-            if checkpoint_result.success: st.success("🎉 **Overall Status: SUCCESS**")
+            if checkpoint_result.success: 
+                st.success("🎉 **Overall Status: SUCCESS**")
+                clear_logs()
             else: st.error("🚨 **Overall Status: FAILURE**")
             display_validation_errors(checkpoint_result)
 
@@ -431,79 +456,114 @@ with automate_tab:
         final_sql_input = ""
         suite_name_prefix = "auto"
         
-        # Step 1: Determine which SQL to use
-        selected_sql_source = st.session_state.auto_sql_source_selector
-        if selected_sql_source == "Generate from Target Inputs":
-            event_type = st.session_state.auto_event_type_gen
-            screen_name = st.session_state.auto_screen_name_gen
-            event_category = st.session_state.get("auto_event_category_gen", "")
-            target = st.session_state.get("auto_target_gen", "")
-            if not screen_name or (event_type in ["click", "impression"] and not all([event_category, target])) or (event_type == "custom" and not event_category):
-                st.error("Please fill in all required fields for the selected Event Type."); st.stop()
-            final_sql_input = generate_automated_sql(screen_name, st.session_state.auto_app_type_gen, event_type, event_category, target)
-            suite_name_prefix = f"{screen_name}_{event_category}_{target}"
-        elif selected_sql_source == "Select Existing SQL File":
-            selected_file = st.session_state.auto_sql_file_selector
-            if not selected_file: st.error("Please select an existing SQL file."); st.stop()
-            with open(os.path.join(SQL_DIR, selected_file), 'r', encoding='utf-8') as f: final_sql_input = f.read()
-            suite_name_prefix = os.path.splitext(selected_file)[0]
-        else: # Write Custom SQL Manually
-            final_sql_input = st.session_state.auto_custom_sql_input
-            if not final_sql_input: st.error("Please enter your custom SQL."); st.stop()
-            if SEGMENT_BY_COLUMNS and "{extra_where_conditions}" not in final_sql_input:
-                st.error("Segmentation is enabled, but the required '{extra_where_conditions}' placeholder is missing in your custom SQL."); st.stop()
-            suite_name_prefix = "custom_sql_suite"
+        # Step 1: Determine SQL
+        with st.spinner("1/4 - Determining and Testing SQL query..."):
+            selected_sql_source = st.session_state.auto_sql_source_selector
+            if selected_sql_source == "Generate from Target Inputs":
+                event_type = st.session_state.auto_event_type_gen
+                screen_name = st.session_state.auto_screen_name_gen
+                event_category = st.session_state.get("auto_event_category_gen", "")
+                target = st.session_state.get("auto_target_gen", "")
+                if not screen_name or (event_type in ["click", "impression"] and not all([event_category, target])) or (event_type == "custom" and not event_category):
+                    st.error("Please fill in all required fields for the selected Event Type."); st.stop()
+                final_sql_input = generate_automated_sql(screen_name, st.session_state.auto_app_type_gen, event_type, event_category, target, SEGMENT_BY_COLUMNS)
+                suite_name_prefix = f"{screen_name}_{event_category}_{target}"
+            elif selected_sql_source == "Select Existing SQL File":
+                selected_file = st.session_state.auto_sql_file_selector
+                if not selected_file: st.error("Please select an existing SQL file."); st.stop()
+                with open(os.path.join(SQL_DIR, selected_file), 'r', encoding='utf-8') as f: final_sql_input = f.read()
+                suite_name_prefix = os.path.splitext(selected_file)[0]
+            else: # Write Custom SQL Manually
+                final_sql_input = st.session_state.auto_custom_sql_input
+                if not final_sql_input: st.error("Please enter your custom SQL."); st.stop()
+                if SEGMENT_BY_COLUMNS and "{extra_where_conditions}" not in final_sql_input:
+                    st.error("Segmentation is enabled, but the required '{extra_where_conditions}' placeholder is missing in your custom SQL."); st.stop()
+                suite_name_prefix = "custom_sql_suite"
 
-        if not final_sql_input.strip():
-            st.error("SQL Query is empty. Please generate, select, or write a query."); st.stop()
-        if not auto_spec_input: st.error("Please provide the Data Spec."); st.stop()
-        
-        suite_name = suite_name_prefix
-        
-        # Step 2: Test SQL Query before calling Gemini
-        with st.spinner("1/4 - Testing SQL query connectivity..."):
+            if not final_sql_input.strip(): st.error("SQL Query is empty."); st.stop()
+            if not auto_spec_input: st.error("Please provide the Data Spec."); st.stop()
+            
             try:
                 engine = create_engine(f'trino://{trino_username}:{urllib.parse.quote(trino_password)}@{trino_host}:{trino_port}/', connect_args={'http_scheme': 'https', 'source': 'gx-streamlit-app-sql-test'})
                 test_query = final_sql_input.format(dt=db_query_date, extra_where_conditions="") + " LIMIT 1"
                 with engine.connect() as conn: conn.execute(text(test_query))
-                st.success("✅ SQL query test run successful.")
+                st.success("✅ SQL query generated and tested successfully.")
             except Exception as e:
                 st.error(f"SQL query failed to execute: {e}")
-                with st.expander("View Failing SQL"):
-                    st.code(test_query, language="sql")
+                with st.expander("View Failing SQL"): st.code(test_query, language="sql")
                 st.stop()
         
-        # Step 3: Generate Expectations
-        with st.spinner("2/4 - Generating expectation rules..."):
-            try:
-                with open("prompt_template.txt", "r", encoding="utf-8") as f: prompt_template = f.read()
-                prompt = prompt_template.format(auto_spec_input=auto_spec_input)
-            except FileNotFoundError: st.error("File not found: 'prompt_template.txt'."); st.stop()
-            try:
-                model = genai.GenerativeModel('gemini-2.5-flash'); response = model.generate_content(prompt)
-                match = re.search(r'\[.*\]', response.text, re.DOTALL)
-                if not match: st.error(f"Could not extract JSON from Gemini's response. Response: {response.text}"); st.stop()
-                generated_json_str = match.group(0)
-                try:
-                    parsed_json = json.loads(generated_json_str)
-                    st.success("✅ Expectation rules generated.")
-                    exp_filepath = os.path.join(EXPECTATIONS_DIR, f"{suite_name}.json")
-                    with open(exp_filepath, 'w', encoding='utf-8') as f: json.dump(parsed_json, f, indent=4, ensure_ascii=False)
-                    st.success(f"✅ Saved expectation file to '{exp_filepath}'")
-                except json.JSONDecodeError as e:
-                    st.error(f"Gemini returned invalid JSON: {e}")
-                    st.info("You can copy the raw text below, fix it, and use it in Manual Mode.")
-                    st.code(generated_json_str, language='json')
-                    st.stop()
-            except Exception as e: st.error(f"An error occurred during the Gemini API call: {e}"); st.stop()
-
-        with st.expander("View Auto-Generated Artifacts"):
-            st.subheader("Final SQL Used")
-            st.code(final_sql_input, language="sql")
-            st.subheader("Generated Expectation Rules")
-            st.json(generated_json_str)
+        suite_name = suite_name_prefix
         
-        # Step 4: Run full validation
+        # Step 2: Generate Expectations with Retry and Fallback
+        with st.spinner("2/4 - Generating expectation rules..."):
+            if not auto_spec_input: st.error("Please provide the Data Spec."); st.stop()
+            
+            MAX_RETRIES = 3
+            generated_json_str = ""
+            is_generation_successful = False
+            error_feedback = ""
+            run_id = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+
+            for attempt in range(MAX_RETRIES):
+                st.info(f"Attempt {attempt + 1}/{MAX_RETRIES} to generate rules...")
+                try:
+                    with open("prompt_template.txt", "r", encoding="utf-8") as f: prompt_template = f.read()
+                    
+                    final_user_input = f"{auto_spec_input}\n{error_feedback}"
+                    prompt = prompt_template.format(auto_spec_input=final_user_input)
+
+                    # Log the prompt
+                    with open(os.path.join(LOGS_DIR, f"{run_id}_attempt_{attempt+1}_prompt.txt"), "w", encoding="utf-8") as f:
+                        f.write(prompt)
+
+                    model = genai.GenerativeModel('gemini-2.5-flash'); response = model.generate_content(prompt)
+                    
+                    # Log the response
+                    with open(os.path.join(LOGS_DIR, f"{run_id}_attempt_{attempt+1}_response.txt"), "w", encoding="utf-8") as f:
+                        f.write(response.text)
+                    
+                    match = re.search(r'\[.*\]', response.text, re.DOTALL)
+                    
+                    if match:
+                        potential_json = match.group(0)
+                        try:
+                            json.loads(potential_json) 
+                            generated_json_str = potential_json
+                            is_generation_successful = True
+                            st.success(f"✅ Attempt {attempt + 1} successful: Gemini generated valid JSON.")
+                            break 
+                        except json.JSONDecodeError as e:
+                            error_detail = f"Invalid JSON syntax at line {e.lineno} col {e.colno}: {e.msg}"
+                            st.warning(f"Attempt {attempt + 1} failed. {error_detail}. Retrying...")
+                            error_feedback = f"<PREVIOUS_ATTEMPT_FEEDBACK>The last attempt failed with this error: {error_detail}. Please ensure your output is a valid JSON.</PREVIOUS_ATTEMPT_FEEDBACK>"
+                    else:
+                        st.warning(f"Attempt {attempt + 1} failed: Gemini did not return a JSON structure. Retrying...")
+                        error_feedback = "<PREVIOUS_ATTEMPT_FEEDBACK>The last attempt did not produce a JSON array. Please ensure your output is a valid JSON array starting with '[' and ending with ']'.</PREVIOUS_ATTEMPT_FEEDBACK>"
+
+                except Exception as e:
+                    st.warning(f"An error occurred during API call on attempt {attempt + 1}: {e}. Retrying...")
+                
+                time.sleep(2)
+
+            if not is_generation_successful:
+                st.warning("AI failed to generate valid rules after all retries. Attempting to use last saved version as fallback...")
+                exp_filepath = os.path.join(EXPECTATIONS_DIR, f"{suite_name}.json")
+                if os.path.exists(exp_filepath):
+                    with open(exp_filepath, 'r', encoding='utf-8') as f:
+                        generated_json_str = f.read()
+                    st.success(f"✅ Successfully loaded last saved rules from '{exp_filepath}'.")
+                else:
+                    st.error(f"No previous version of '{exp_filepath}' found. Cannot proceed."); st.stop()
+            
+            exp_filepath = os.path.join(EXPECTATIONS_DIR, f"{suite_name}.json")
+            with open(exp_filepath, 'w', encoding='utf-8') as f: f.write(generated_json_str)
+            st.success(f"✅ Saved/updated expectation file to '{exp_filepath}'")
+
+        with st.expander("View Final Artifacts Used"):
+            st.subheader("Final SQL Used"); st.code(final_sql_input, language="sql")
+            st.subheader("Final Expectation Rules Used"); st.json(generated_json_str)
+        
         st.info("3/4 - Starting the full validation process...")
         db_config = (trino_host, trino_port, trino_username, trino_password)
         val_params = (db_query_date, SEGMENT_BY_COLUMNS)
@@ -511,25 +571,26 @@ with automate_tab:
         checkpoint_result, data_samples = run_validation_process(final_sql_input, generated_json_str, suite_name, db_config, val_params)
         
         if checkpoint_result:
-            st.header("🔬 Data Samples (First 5 Rows)")
-            if data_samples:
-                for segment_name, sample_df in data_samples.items():
-                    with st.expander(f"Data for Segment: {segment_name}"):
-                        st.dataframe(sample_df, use_container_width=True)
-
+            clear_logs()
+            st.success("Logs for this successful run have been cleared.")
 
             st.header("📊 Final Validation Results")
             if checkpoint_result.success: st.success("🎉 **Overall Status: SUCCESS**")
             else: st.error("🚨 **Overall Status: FAILURE**")
             display_validation_errors(checkpoint_result)
             
-           
+            st.header("🔬 Data Samples (First 5 Rows)")
+            if data_samples:
+                for segment_name, sample_df in data_samples.items():
+                    with st.expander(f"Data for Segment: {segment_name}"):
+                        st.dataframe(sample_df, use_container_width=True)
+
             with st.expander("View Full JSON Result"):
                 st.json(checkpoint_result.to_json_dict())
 
             st.subheader("🔗 Data Docs")
             with st.spinner("Building Data Docs..."):
-                context = gx.get_context(); context.build_data_docs()
+                context = gx.get_context(project_root_dir=os.getcwd()); context.build_data_docs()
                 docs_sites = context.get_docs_sites_urls()
                 if docs_sites:
                     st.info("Copy the path below into a new browser tab to open the full report:")
