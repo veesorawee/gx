@@ -1,6 +1,4 @@
 SELECT
-    os_name,
-    app_ver,
     screen_name,
     event,
     screen,
