@@ -139,35 +139,37 @@ def run_validation_process(sql_input, expectations_input, suite_name, db_config,
         except json.JSONDecodeError:
             status.update(label="Input Error", state="error"); st.error("Invalid Expectations JSON format."); return None, None
         
+        # --- Discovery Logic ---
         status.write("🔍 Discovering object columns and fields to flatten from expectations...")
+        schema_expectations = [exp for exp in expectations_list if exp.get('expectation_type') == 'expect_column_values_to_match_json_schema']
+        object_columns = sorted(list(set([exp['kwargs']['column'] for exp in schema_expectations])))
         
-        # 1. Get all top-level columns from the SQL to avoid flattening existing columns
-        top_level_columns = parse_select_columns(sql_input)
-        
-        all_columns_in_rules = {exp['kwargs']['column'] for exp in expectations_list if 'column' in exp.get('kwargs', {})}
-        
-        # 2. Infer parent objects by looking for the 'parent_child' naming convention
-        potential_parents = {col.split('_')[0] for col in all_columns_in_rules if '_' in col}
-        object_columns = sorted(list(potential_parents))
-
         keys_to_flatten_map = {obj_col: [] for obj_col in object_columns}
-        
         if object_columns:
-            status.write(f"**Identified potential Object columns:** `{object_columns}`")
+            status.write(f"**Identified Parent Object columns:** `{object_columns}`")
+            # Also get keys from schema properties
+            for exp in schema_expectations:
+                parent_col = exp['kwargs']['column']
+                properties = exp['kwargs'].get('json_schema', {}).get('properties', {})
+                keys_to_flatten_map[parent_col].extend(properties.keys())
+
+            # Also get keys from flattened column name patterns
+            all_columns_in_rules = {exp['kwargs']['column'] for exp in expectations_list if 'column' in exp.get('kwargs', {})}
             for col_name in all_columns_in_rules:
-                # 3. Check if a rule's column is a child of a potential parent
-                if "_" in col_name and col_name.split('_')[0] in object_columns:
-                    # 4. CRITICAL: Only flatten if the column does NOT already exist at the top level
-                    if col_name not in top_level_columns:
-                        parent = col_name.split('_')[0]
+                if "_" in col_name:
+                    parent = col_name.split('_')[0]
+                    if parent in keys_to_flatten_map:
                         key = col_name[len(parent) + 1:]
                         if key not in keys_to_flatten_map[parent]:
                             keys_to_flatten_map[parent].append(key)
-
-            status.write("🗺️ **Final fields to flatten:**")
+            
+            status.write("🗺️ **Fields to flatten:**")
             for obj_col, keys in keys_to_flatten_map.items():
-                if keys: status.write(f"&nbsp;&nbsp;&nbsp;↳ For `{obj_col}`: `{sorted(keys)}`", unsafe_allow_html=True)
-        
+                if keys:
+                    keys_to_flatten_map[obj_col] = sorted(list(set(keys))) # Remove duplicates and sort
+                    status.write(f"&nbsp;&nbsp;&nbsp;↳ For `{obj_col}`: `{keys_to_flatten_map[obj_col]}`", unsafe_allow_html=True)
+
+
         status.write(f"**1. 🔗 Connecting to DB...**")
         try:
             engine = create_engine(f'trino://{trino_username}:{urllib.parse.quote(trino_password)}@{trino_host}:{trino_port}/', connect_args={'http_scheme': 'https', 'source': 'gx-streamlit-app'})
