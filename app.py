@@ -480,7 +480,7 @@ with automate_tab:
                 prompt = prompt_template.format(auto_spec_input=auto_spec_input)
             except FileNotFoundError: st.error("File not found: 'prompt_template.txt'."); st.stop()
             try:
-                model = genai.GenerativeModel('gemini-1.5-flash'); response = model.generate_content(prompt)
+                model = genai.GenerativeModel('gemini-2.5-flash'); response = model.generate_content(prompt)
                 match = re.search(r'\[.*\]', response.text, re.DOTALL)
                 if not match: st.error(f"Could not extract JSON from Gemini's response. Response: {response.text}"); st.stop()
                 generated_json_str = match.group(0)
