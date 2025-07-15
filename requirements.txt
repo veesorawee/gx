@@ -1,6 +1,6 @@
 streamlit
 pandas
-great-expectations
+great-expectations==0.18.22
 google-generativeai
 python-dotenv
 sqlalchemy
