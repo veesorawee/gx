@@ -115,15 +115,20 @@ def display_validation_errors(checkpoint_result):
                     unexpected_count = result.result.get("unexpected_count", 0)
                     element_count = result.result.get("element_count", 0)
                     error_percent = (unexpected_count / element_count) * 100 if element_count > 0 else 0
+                    
+                    raw_examples = result.result.get("partial_unexpected_list", [])
+                    string_examples = [str(item) for item in raw_examples]
+
                     failed_results_list.append({
                         "Segment": segment, "Expectation": result.expectation_config.expectation_type,
                         "Column": kwargs.get("column", "N/A"), "Expected": str(expected),
                         "Error Count": unexpected_count, "Error %": error_percent,
-                        "Failing Examples": result.result.get("partial_unexpected_list", [])
+                        "Failing Examples": string_examples # Use the sanitized list
                     })
     if failed_results_list:
         st.subheader("Failure Summary")
         df = pd.DataFrame(failed_results_list)
+        # This will now work correctly as "Failing Examples" is a consistent list of strings.
         st.data_editor(df, column_config={
                 "Error %": st.column_config.ProgressColumn("Error Rate", format="%.2f%%", min_value=0, max_value=100),
                 "Failing Examples": st.column_config.ListColumn("Examples", width="large"),
