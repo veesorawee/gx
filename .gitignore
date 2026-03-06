@@ -5,6 +5,8 @@
 sql/
 expectations/
 logs/
+static/
+reports/
 
 # Great Expectations temporary files
 great_expectations/uncommitted/
