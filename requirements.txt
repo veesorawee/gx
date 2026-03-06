@@ -5,3 +5,7 @@ google-generativeai
 python-dotenv
 sqlalchemy
 trino
+tabulate
+openpyxl
+weasyprint
+pypdf

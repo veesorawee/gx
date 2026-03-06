@@ -24,7 +24,9 @@ This project was built with the help of AI assistants - mainly **Google's Gemini
 - 📁 **File management**: Load, save, and preview your SQL and validation files
 - 📈 **Rich results**: See validation results with error percentages and data samples
 - 📚 **Data Docs**: Automatically creates detailed HTML reports you can browse
-- 🔄 **Retry logic**: AI generation with smart fallbacks if something goes wrong
+- � **PDF Reports**: Auto-generates professional "Tracking Validation" PDF summaries.
+- 🛑 **Waive Rules**: Exclude false positives, regenerate metrics, and update reports on the fly.
+- �🔄 **Retry logic**: AI generation with smart fallbacks if something goes wrong
 
 ## Getting Started
 
@@ -49,7 +51,12 @@ git clone https://github.com/veesorawee/gx.git
 cd gx
 ```
 
-**3. Set up your Python environment**
+**3. Install OS Dependencies (for PDF Generation)**
+```bash
+brew install pango libffi glib
+```
+
+**4. Set up your Python environment**
 ```bash
 # Create a clean space for this project
 python3 -m venv venv
@@ -58,7 +65,7 @@ python3 -m venv venv
 source venv/bin/activate
 ```
 
-**4. Install everything**
+**5. Install everything**
 ```bash
 pip install -r requirements.txt
 ```
@@ -131,17 +138,18 @@ Your browser should open automatically to the app!
 
 ## What's in the folder?
 
-```
+```text
 gx/
 ├── .env                # Your secret settings (don't share this!)
 ├── .env.example        # Example of what .env should look like
-├── app.py              # The main app code
+├── app_v6.py           # The main app code
 ├── expectations/       # Where validation rules are saved
-├── logs/              # Debugging logs (auto-created)
+├── logs/               # Debugging logs (auto-created)
+├── reports/            # Output folder for generated PDF reports
 ├── prompt_template.txt # How the AI knows what to do
 ├── requirements.txt    # List of Python packages needed
-├── sql/               # Where your SQL files live
-└── sql_template.txt   # Template for auto-generated SQL
+├── sql/                # Where your SQL files live
+└── sql_template.txt    # Template for auto-generated SQL
 ```
 
 ## Need Help?
