@@ -259,10 +259,10 @@ def render_summary_metrics(batch, batch_id_display):
     success_count, fail_count, error_count = get_effective_metrics(results, batch["waived_rules"])
     st.caption(f"🏷️ Batch ID: `{batch_id_display}` | รวม {len(results)} specs")
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("✅ ผ่าน", success_count)
-    c2.metric("⚠️ ไม่ตรง Spec", fail_count)
-    c3.metric("❌ Error", error_count)
-    c4.metric("📊 รวม", len(results))
+    c1.metric("✅ Passed", success_count)
+    c2.metric("❌ Mismatch", fail_count)
+    c3.metric("🚨 Error", error_count)
+    c4.metric("📊 Total", len(results))
     st.markdown("---")
 
 def parse_select_columns(sql_string: str) -> list[str]:
@@ -572,22 +572,45 @@ def extract_failed_items(results, waived_rules=None):
             
             run_results = run_data.get("log_data", {}).get("run_results", {})
             for vr_key, vr_val in run_results.items():
-                for exp_result in vr_val.get("validation_result", {}).get("results", []):
+                total_exp = 0
+                fail_count = 0
+                validation = vr_val.get("validation_result", {})
+                for exp_result in validation.get("results", []):
+                    total_exp += 1
                     if not exp_result.get("success", False):
                         exp_config = exp_result.get("expectation_config", {})
                         exp_type = exp_config.get("expectation_type", "").replace("expect_column_values_to_", "").replace("expect_table_columns_to_", "table_")
                         col = exp_config.get("kwargs", {}).get("column", "-")
-                        if "expect_table" in exp_config.get("expectation_type", ""):
-                            col = "-"
+                        if "expect_table" in exp_config.get("expectation_type", ""): col = "-"
                         rule_key = f"{col} ({exp_type})"
-                        
-                        if rule_key not in waived_rules:
-                            failed_items.append({
-                                "col": col, "exp_type": exp_type, "rule_key": rule_key,
-                                "placement": spec_key, "count": exp_result.get("result", {}).get("unexpected_count", 0),
-                                "kwargs": exp_config.get("kwargs", {}),
-                                "examples": exp_result.get("result", {}).get("partial_unexpected_list", [])
-                            })
+                        if rule_key not in waived_rules: # Assuming waived_rules is passed correctly here
+                            fail_count += 1
+                
+                # If no rules were generated, treat as an error for this specific validation result
+                if total_exp == 0:
+                    # This part of the code is for extracting failed items,
+                    # so if there are no rules, there are no *failed* items to extract.
+                    # The "No Rules" error is handled at a higher level (get_effective_metrics, get_effective_tracker_data)
+                    # and in the PDF generation for display purposes.
+                    pass
+                else:
+                    # Original logic for failed items extraction
+                    for exp_result in validation.get("results", []):
+                        if not exp_result.get("success", False):
+                            exp_config = exp_result.get("expectation_config", {})
+                            exp_type = exp_config.get("expectation_type", "").replace("expect_column_values_to_", "").replace("expect_table_columns_to_", "table_")
+                            col = exp_config.get("kwargs", {}).get("column", "-")
+                            if "expect_table" in exp_config.get("expectation_type", ""):
+                                col = "-"
+                            rule_key = f"{col} ({exp_type})"
+                            
+                            if rule_key not in waived_rules:
+                                failed_items.append({
+                                    "col": col, "exp_type": exp_type, "rule_key": rule_key,
+                                    "placement": spec_key, "count": exp_result.get("result", {}).get("unexpected_count", 0),
+                                    "kwargs": exp_config.get("kwargs", {}),
+                                    "examples": exp_result.get("result", {}).get("partial_unexpected_list", [])
+                                })
     return failed_items
 
 def get_effective_metrics(results, waived_rules=None):
@@ -602,9 +625,12 @@ def get_effective_metrics(results, waived_rules=None):
             continue
         
         has_unwaived = False
+        has_tests = False
         run_results = run_data.get("log_data", {}).get("run_results", {})
         for vr_key, vr_val in run_results.items():
-            for exp_result in vr_val.get("validation_result", {}).get("results", []):
+            results_list = vr_val.get("validation_result", {}).get("results", [])
+            if results_list: has_tests = True
+            for exp_result in results_list:
                 if not exp_result.get("success", False):
                     exp_config = exp_result.get("expectation_config", {})
                     exp_type = exp_config.get("expectation_type", "").replace("expect_column_values_to_", "").replace("expect_table_columns_to_", "table_")
@@ -616,7 +642,8 @@ def get_effective_metrics(results, waived_rules=None):
                         break
             if has_unwaived: break
                 
-        if has_unwaived: fail += 1
+        if not has_tests: error += 1
+        elif has_unwaived: fail += 1
         else: success += 1
     return success, fail, error
 
@@ -644,13 +671,16 @@ def get_effective_tracker_data(tracker, results, waived_rules=None):
                             passed_exp += 1
             if total_exp > 0:
                 v_copy["Pass/Fail"] = f"{passed_exp}/{total_exp} ({round(passed_exp / total_exp * 100)}%)"
-            v_copy["Result"] = "✅ Passed" if passed_exp == total_exp else "⚠️ Mismatch"
+                v_copy["Result"] = "✅ Passed" if passed_exp == total_exp else "❌ Mismatch"
+            else:
+                v_copy["Pass/Fail"] = "0/0 (0%)"
+                v_copy["Result"] = "🚨 Error (No Rules)"
         elif matching_run and matching_run.get("status") == "ERROR":
-            v_copy["Result"] = "❌ Error"
+            v_copy["Result"] = "🚨 Error"
         
         if v_copy["Result"] == "✅ Passed": v_copy["_status_class"] = "pass"
-        elif v_copy["Result"] == "⚠️ Mismatch": v_copy["_status_class"] = "fail"
-        elif v_copy["Result"] == "❌ Error": v_copy["_status_class"] = "fail"
+        elif v_copy["Result"] == "❌ Mismatch": v_copy["_status_class"] = "fail"
+        elif "Error" in v_copy["Result"]: v_copy["_status_class"] = "error"
         else: v_copy["_status_class"] = "skip"
         
         effective_tracker.append(v_copy)
@@ -721,6 +751,11 @@ def generate_batch_report_pdf(batch_data, waived_rules=None):
             expectation_results = validation.get("results", [])
             
             if not expectation_results:
+                details_html += f"""<div class="spec-section">
+                <h3>{placement_label}</h3>
+                <p class="suite-ref">Suite: {suite_ref}</p>
+                <p>❌ ERROR: No validation rules were generated, or the suite was empty.</p>
+            </div>"""
                 continue
             all_rows = ""
             pass_count = 0
@@ -802,8 +837,8 @@ def generate_batch_report_pdf(batch_data, waived_rules=None):
                     <td class="detail-cell">{detail_cell}</td>
                 </tr>"""
             
-            overall_success = validation.get("success", False)
-            status_label = "PASS ✅" if overall_success else "FAILURE ❌"
+            effective_success = (fail_count_detail == 0)
+            status_label = "PASS ✅" if effective_success else "FAILURE ❌"
             
             total_exp = pass_count + fail_count_detail + c_waive_count
             summary_badges = f"✅ {pass_count} passed | ❌ {fail_count_detail} failed"
@@ -976,7 +1011,7 @@ def generate_batch_report_pdf(batch_data, waived_rules=None):
                 if ex_str: d_parts.append(f"<span style='font-size:8px;color:#7f8c8d;'>Ex: {ex_str}</span>")
                 detail_html = "<br>".join(d_parts)
             
-            waived_rows += f'<tr class="row-waived"><td><b>{w_col}</b></td><td><span style="color:#7f8c8d;font-family:monospace;">{w_exp}</span></td><td>{detail_html}</td><td style="text-align:center;color:#d35400;">{info["count"]}</td><td style="font-size:7px;color:#7f8c8d;">{plc_str}</td></tr>'
+            waived_rows += f'<tr class="row-waived"><td><b>{w_col}</b></td><td><span style="color:#7f8c8d;font-family:monospace;">{w_exp}</span></td><td style="word-wrap: break-word; word-break: break-all; max-width: 250px;">{detail_html}</td><td style="text-align:center;color:#d35400;">{info["count"]}</td><td style="font-size:7px;color:#7f8c8d;">{plc_str}</td></tr>'
             
         waived_rules_html = f"""
 <h2 style="color: #d35400;">🛑 Waived Rules</h2>
@@ -1411,8 +1446,8 @@ def bulk_validation_ui():
                                         "rule_count": len(parsed_json)
                                     })
                                 else:
-                                    shared["tracker"][spec_str]["AI"] = "❌ Failed"
-                                    shared["tracker"][spec_str]["Result"] = "❌ AI ไม่ตอบ JSON"
+                                    shared["tracker"][spec_str]["AI"] = "🚨 Error"
+                                    shared["tracker"][spec_str]["Result"] = "🚨 AI ไม่ตอบ JSON"
                                 
                                 # Save success log
                                 with open(log_md_filename, "w", encoding="utf-8") as log_f:
@@ -1426,8 +1461,8 @@ def bulk_validation_ui():
                                 print("=======================")
                                 err_name = type(e).__name__
                                 err_msg = str(e)[:30] + "..." if len(str(e)) > 30 else str(e)
-                                shared["tracker"][spec_str]["AI"] = f"❌ {err_name}"
-                                shared["tracker"][spec_str]["Result"] = f"❌ Error: {err_msg}"
+                                shared["tracker"][spec_str]["AI"] = f"🚨 {err_name}"
+                                shared["tracker"][spec_str]["Result"] = f"🚨 Error: {err_msg}"
                                 
                                 # Save error log
                                 with open(log_md_filename, "w", encoding="utf-8") as log_f:
@@ -1440,8 +1475,8 @@ def bulk_validation_ui():
                             print("=============================")
                             err_name = type(e).__name__
                             err_msg = str(e)[:30] + "..." if len(str(e)) > 30 else str(e)
-                            shared["tracker"][spec_str]["AI"] = f"❌ {err_name}"
-                            shared["tracker"][spec_str]["Result"] = f"❌ Error: {err_msg}"
+                            shared["tracker"][spec_str]["AI"] = f"🚨 {err_name}"
+                            shared["tracker"][spec_str]["Result"] = f"🚨 Error: {err_msg}"
                             # Save error log for outer errors (API, retry, etc.)
                             try:
                                 log_md_filename = os.path.join(LOGS_DIR, f"ai_log_{suite_name}_{int(time.time())}.md")
@@ -1538,11 +1573,11 @@ def bulk_validation_ui():
                     run_data = {
                         "id": run_id, "name": suite_name, "timestamp": datetime.datetime.now().isoformat(),
                         "ev_type": ev_type, "plc_id": plc_id,
-                        "status": "SUCCESS" if checkpoint_result and checkpoint_result.success else "FAILURE",
+                        "status": "SUCCESS" if checkpoint_result and checkpoint_result.success else ("ERROR" if checkpoint_result is None else "FAILURE"),
                         "run_name": run_name, "batch_id": shared.get("batch_id", ""),
                         "checkpoint_result": checkpoint_result, "data_samples": data_samples, "docs": docs_info,
                         "docs_url": best_docs_url,
-                        "log_data": checkpoint_result.to_json_dict() if checkpoint_result else {"error": "Process failed"},
+                        "log_data": checkpoint_result.to_json_dict() if checkpoint_result else {"error": "Process failed or returned empty data"},
                         "validation_process_log": process_log, "docs_error": docs_error,
                         "ai_prompt": prompt, "ai_response": item.get("ai_response", "")
                     }
@@ -1565,12 +1600,14 @@ def bulk_validation_ui():
                         pct = round(passed_expectations / total_expectations * 100) if total_expectations > 0 else 0
                         shared["tracker"][spec_str]["Pass/Fail"] = f"{passed_expectations}/{total_expectations} ({pct}%)"
                     
-                    shared["tracker"][spec_str]["GX"] = "✅ Done"
+                    if not checkpoint_result:
+                        shared["tracker"][spec_str]["GX"] = "🚨 Error"
+                    else:
+                        shared["tracker"][spec_str]["GX"] = "✅ Done"
                     
-                    # Data Docs link — ใช้ segment URL (ชี้ไปที่ผลรันเฉพาะ) แทน local_path (หน้ารวม)
+                    # Data Docs link
                     docs_segments = (docs_info or {}).get("segments", {})
                     if docs_segments:
-                        # ใช้ URL แรกจาก segments (ปกติมี 1 segment ต่อ 1 run)
                         docs_url = list(docs_segments.values())[0]
                     else:
                         docs_url = (docs_info or {}).get("local_path", "")
@@ -1579,14 +1616,16 @@ def bulk_validation_ui():
                     
                     if run_data['status'] == "SUCCESS":
                         shared["tracker"][spec_str]["Result"] = "✅ Passed"
+                    elif run_data['status'] == "ERROR":
+                        shared["tracker"][spec_str]["Result"] = "🚨 Error"
                     else:
-                        shared["tracker"][spec_str]["Result"] = "⚠️ Mismatch"
+                        shared["tracker"][spec_str]["Result"] = "❌ Mismatch"
 
                 except Exception as e: 
                     tb_str = traceback.format_exc()
                     error_msg = f"{type(e).__name__}: {str(e)}"
-                    shared["tracker"][spec_str]["GX"] = "❌ Failed"
-                    shared["tracker"][spec_str]["Result"] = f"❌ Error: {type(e).__name__}"
+                    shared["tracker"][spec_str]["GX"] = "🚨 Error"
+                    shared["tracker"][spec_str]["Result"] = f"🚨 Error: {type(e).__name__}"
                     
                     error_run_id = str(uuid.uuid4())
                     error_log_data = {
