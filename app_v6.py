@@ -224,14 +224,45 @@ def render_waive_ui(batch):
             
             submit_waive = st.form_submit_button("✅ 1. Confirm Waived Rules & Regenerate Report", type="primary")
             if submit_waive:
+                # สร้าง mapping จาก rule_key ไปหา original expectation type
+                rule_key_to_original_type = {
+                    item["rule_key"]: item.get("exp_type_original", "") 
+                    for item in all_failed_items
+                }
+                
                 current_waives = set()
+                structured_waives = [] # อันนี้สำหรับเซฟลง JSON ให้ Web App อื่นอ่านง่ายขึ้น
+
                 for idx, row in edited_df.iterrows():
                     if row["Waive"]:
-                        current_waives.add(f"{row['Column']} ({row['Rule']})")
+                        rule_key = f"{row['Column']} ({row['Rule']})"
+                        current_waives.add(rule_key)
+                        
+                        structured_waives.append({
+                            "column": row['Column'],
+                            "short_rule": row['Rule'],
+                            "expectation_type": rule_key_to_original_type.get(rule_key, ""),
+                            "rule_key": rule_key
+                        })
                         
                 batch["waived_rules"] = current_waives
                 
                 try:
+                    # ✅ [ NEW ] เซฟ waived_rules กลับเข้าไปในไฟล์ JSON ของแต่ละ run ใน Batch
+                    for run in batch.get("results", []):
+                        if "log_filepath" in run and os.path.exists(run["log_filepath"]):
+                            try:
+                                with open(run["log_filepath"], 'r', encoding='utf-8') as f:
+                                    log_data = json.load(f)
+                                
+                                # อัปเดตข้อมูลแบบ Structured JSON เข้าไปใน log_data
+                                log_data["waived_rules"] = structured_waives
+                                
+                                with open(run["log_filepath"], 'w', encoding='utf-8') as f:
+                                    json.dump(log_data, f, indent=4)
+                            except Exception as json_err:
+                                st.warning(f"⚠️ Could not update waived_rules in log file {run['log_filepath']}: {json_err}")
+                    
                     pdf_path = generate_batch_report_pdf(batch, batch["waived_rules"])
                     batch["pdf_path"] = pdf_path
                 except Exception as e:
@@ -344,7 +375,13 @@ def display_validation_errors(checkpoint_result, waived_rules=None):
                 "Expected": st.column_config.TextColumn("Expected Value", width="medium"),
             }, use_container_width=True, hide_index=True)
 
-def run_validation_process(sql_input, expectations_input, suite_name, db_config, val_params, flatten_map=None, batch_id=None):
+class DummyStatus:
+    def write(self, *args, **kwargs): pass
+    def update(self, *args, **kwargs): pass
+    def __enter__(self): return self
+    def __exit__(self, exc_type, exc_val, exc_tb): pass
+
+def run_validation_process(sql_input, expectations_input, suite_name, db_config, val_params, flatten_map=None, batch_id=None, background=False):
     trino_host, trino_port, trino_username, trino_password = db_config
     db_query_date, SEGMENT_BY_COLUMNS = val_params
     context = gx.get_context(project_root_dir=os.getcwd())
@@ -353,7 +390,9 @@ def run_validation_process(sql_input, expectations_input, suite_name, db_config,
     run_name = None
     docs_error = None
 
-    with st.status("🚀 Starting Validation Process...", expanded=True) as status:
+    status_context = DummyStatus() if background else st.status("🚀 Starting Validation Process...", expanded=True)
+
+    with status_context as status:
         def log_and_write(message):
             process_log.append(message)
             status.write(message)
@@ -363,7 +402,9 @@ def run_validation_process(sql_input, expectations_input, suite_name, db_config,
         try:
             expectations_list = json.loads(expectations_input)
         except json.JSONDecodeError:
-            status.update(label="Input Error", state="error"); st.error("Invalid Expectations JSON format."); return None, None, None, process_log, run_name, None
+            process_log.append("🚨 ERROR: Invalid Expectations JSON format.")
+            if not background: status.update(label="Input Error", state="error"); st.error("Invalid Expectations JSON format.")
+            return None, None, None, process_log, run_name, None
 
         log_and_write("🔍 Discovering object columns...")
         if flatten_map:
@@ -400,7 +441,9 @@ def run_validation_process(sql_input, expectations_input, suite_name, db_config,
             with engine.connect() as conn: conn.execute(text("SELECT 1"))
             log_and_write("... ✅ Connection successful.")
         except Exception as e:
-            status.update(label="Connection Failed", state="error"); st.error(f"Could not connect to Database: {e}"); return None, None, None, process_log, run_name, None
+            process_log.append(f"🚨 ERROR: Could not connect to Database: {e}")
+            if not background: status.update(label="Connection Failed", state="error"); st.error(f"Could not connect to Database: {e}")
+            return None, None, None, process_log, run_name, None
 
         segments_to_run = []
         if SEGMENT_BY_COLUMNS:
@@ -411,9 +454,13 @@ def run_validation_process(sql_input, expectations_input, suite_name, db_config,
                 segments_df = pd.read_sql(text(discovery_sql), engine)
                 segments_to_run = segments_df.to_dict('records')
             except Exception as e:
-                status.update(label="Error", state="error"); st.error(f"Error discovering segments: {e}"); return None, None, None, process_log, run_name, None
+                process_log.append(f"🚨 ERROR: Error discovering segments: {e}")
+                if not background: status.update(label="Error", state="error"); st.error(f"Error discovering segments: {e}")
+                return None, None, None, process_log, run_name, None
             if not segments_to_run:
-                status.update(label="Warning", state="error"); st.warning(f"⚠️ No segments found for date `{db_query_date}`."); return None, None, None, process_log, run_name, None
+                process_log.append(f"⚠️ Warning: No segments found for date `{db_query_date}`.")
+                if not background: status.update(label="Warning", state="error"); st.warning(f"⚠️ No segments found for date `{db_query_date}`.")
+                return None, None, None, process_log, run_name, None
             log_and_write(f"... ✅ Found **{len(segments_to_run)}** segments.")
         else:
             log_and_write("**2. 🗂️ No segmentation specified.**")
@@ -509,7 +556,8 @@ def run_validation_process(sql_input, expectations_input, suite_name, db_config,
                 
                 # เขียนข้อความสั้นๆ ให้ User เห็นตอนรัน
                 status.write(f"&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;- 🚨 Failed: {e}")
-                st.expander(f"Full Error Traceback for Segment: {segment_name}").code(tb_str, language='text')
+                if not background:
+                    st.expander(f"Full Error Traceback for Segment: {segment_name}").code(tb_str, language='text')
                 
                 # [เพิ่มตรงนี้] เอา Full Traceback ยัดใส่ Markdown เพื่อให้เซฟลง History Log ด้วย
                 error_log_markdown = (
@@ -522,7 +570,9 @@ def run_validation_process(sql_input, expectations_input, suite_name, db_config,
                 continue
 
         if not validations_to_run:
-            status.update(label="Error", state="error"); st.error("No valid batches were created."); return None, None, None, process_log, run_name, None
+            process_log.append("🚨 ERROR: No valid batches were created.")
+            if not background: status.update(label="Error", state="error"); st.error("No valid batches were created.")
+            return None, None, None, process_log, run_name, None
 
         log_and_write("**4. 🏁 Running final Great Expectations checkpoint...**")
         checkpoint = context.add_or_update_checkpoint(name=f"checkpoint_{run_name}", run_name_template=run_name,
@@ -557,7 +607,7 @@ def run_validation_process(sql_input, expectations_input, suite_name, db_config,
         else:
             log_and_write("... ⚠️ Could not retrieve local path for Data Docs.")
                             
-        status.update(label="✅ **Validation Process Complete!**", state="complete", expanded=False)
+        if not background: status.update(label="✅ **Validation Process Complete!**", state="complete", expanded=False)
 
     return checkpoint_result, data_samples, docs_info, process_log, run_name, docs_error
 
@@ -607,6 +657,7 @@ def extract_failed_items(results, waived_rules=None):
                             if rule_key not in waived_rules:
                                 failed_items.append({
                                     "col": col, "exp_type": exp_type, "rule_key": rule_key,
+                                    "exp_type_original": exp_config.get("expectation_type", ""),
                                     "placement": spec_key, "count": exp_result.get("result", {}).get("unexpected_count", 0),
                                     "kwargs": exp_config.get("kwargs", {}),
                                     "examples": exp_result.get("result", {}).get("partial_unexpected_list", [])
@@ -1162,7 +1213,13 @@ def manual_ui():
             "validation_process_log": process_log,
             "docs_error": docs_error
         }
-        log_filepath = os.path.join(LOGS_DIR, f"run-{run_id}.json")
+        # ✅ [ UPLOAD MODE ]: Set log filepath with descriptive name
+        safe_ev = str(run_data.get('ev_type', 'upload')).replace('/', '_')
+        safe_plc = str(run_data.get('plc_id', 'manual')).replace('/', '_')
+        run_short_id = run_data.get('id', 'unknown')[:8]
+        log_filename = f"run_upload_{safe_ev}_{safe_plc}_{run_short_id}.json"
+        log_filepath = os.path.join(LOGS_DIR, log_filename)
+        run_data["log_filepath"] = log_filepath # Save the path to the run_data so it can be updated by Waive Rules
         with open(log_filepath, 'w', encoding='utf-8') as f: json.dump(run_data['log_data'], f, indent=4)
         st.session_state.history.insert(0, run_data)
         st.session_state.active_run_id = run_id
@@ -1286,7 +1343,11 @@ def bulk_validation_ui():
                 "checked_count": 0,
                 "found_count": 0,
                 "tracker": initial_tracker,
-                "batch_id": batch_id
+                "batch_id": batch_id,
+                "gx_results": [],
+                "gx_active_count": 0,
+                "retry_count": {},
+                "last_gx_error": {}
             }
             st.session_state.overall_results = []
             
@@ -1387,6 +1448,11 @@ def bulk_validation_ui():
                             model_name = os.getenv('GEMINI_MODEL_ID', 'gemini-2.5-flash')
                             model = genai.GenerativeModel(model_name)
                             
+                            retries = shared.get("retry_count", {}).get(spec_str, 0)
+                            if retries > 0:
+                                last_err = shared.get("last_gx_error", {}).get(spec_str, "Unknown Error")
+                                prompt += f"\n\n🚨 [SYSTEM WARNING]: Your previous JSON generated a Great Expectations Exception:\n{last_err}\n\nPlease fix your JSON (e.g. check parameter usage or column existence) so it runs successfully."
+                            
                             # === Retry Logic + Exponential Backoff ===
                             max_retries = 5
                             base_delay = 5 # วิ
@@ -1485,14 +1551,109 @@ def bulk_validation_ui():
                             except: pass
                         
                         time.sleep(0.1)
-                    elif shared["is_done"]:
+                    elif shared["is_done"] and len(shared["queue"]) == 0 and len(shared["ai_queue"]) == 0 and shared.get("gx_active_count", 0) == 0:
                         break
                     else:
                         time.sleep(0.5)
                 
                 shared["ai_is_done"] = True
 
-            # เริ่มสั่ง Thread หลังบ้าน (ทั้ง 2 ตัว)
+            # ===== Thread 3: GX Worker =====
+            def gx_worker(shared, val_params_tuple, sql_cfg, db_config):
+                while True:
+                    item = None
+                    try:
+                        if shared["ai_queue"]:
+                            item = shared["ai_queue"].pop(0)
+                        
+                        if item:
+                            shared["gx_active_count"] += 1
+                            spec_str = item["spec_str"]
+                            ev_type = item["ev_type"]
+                            plc_id = item["plc_id"]
+                            suite_name = item["suite_name"]
+                            final_expectations = item["expectations"]
+                            flatten_map = item["flatten_map"]
+                            prompt = item["prompt"]
+                            
+                            shared["tracker"][spec_str]["GX"] = "🔄 รันตรวจ Data..."
+                            
+                            base_sql = ""
+                            if sql_cfg["source"] == "Select Existing SQL File":
+                                with open(os.path.join(SQL_DIR, sql_cfg["file"]), 'r', encoding='utf-8') as f: base_sql = f.read()
+                            else:
+                                base_sql = sql_cfg["custom_sql"]
+                            final_sql = prepare_spec_sql(base_sql, ev_type, plc_id)
+
+                            checkpoint_result, data_samples, docs_info, process_log, run_name, docs_error = run_validation_process(
+                                final_sql, final_expectations, suite_name, db_config, val_params_tuple,
+                                flatten_map=flatten_map, batch_id=shared.get("batch_id"), background=True
+                            )
+                            
+                            run_id = str(uuid.uuid4())
+                            _docs_segs = (docs_info or {}).get("segments", {})
+                            best_docs_url = list(_docs_segs.values())[0] if _docs_segs else (docs_info or {}).get("local_path", "")
+                            
+                            run_data = {
+                                "id": run_id, "name": suite_name, "timestamp": datetime.datetime.now().isoformat(),
+                                "ev_type": ev_type, "plc_id": plc_id,
+                                "status": "SUCCESS" if checkpoint_result and checkpoint_result.success else ("ERROR" if checkpoint_result is None else "FAILURE"),
+                                "run_name": run_name, "batch_id": shared.get("batch_id", ""),
+                                "checkpoint_result": checkpoint_result, "data_samples": data_samples, "docs": docs_info,
+                                "docs_url": best_docs_url,
+                                "log_data": checkpoint_result.to_json_dict() if checkpoint_result else {"error": "Process failed or returned empty data"},
+                                "validation_process_log": process_log, "docs_error": docs_error,
+                                "ai_prompt": prompt, "ai_response": item.get("ai_response", ""),
+                                "spec_str": spec_str
+                            }
+                            shared["gx_results"].append(run_data)
+                            shared["gx_active_count"] -= 1
+
+                        elif shared["ai_is_done"]:
+                            break
+                        else:
+                            time.sleep(1)
+                            
+                    except Exception as e:
+                        if item:
+                            spec_str = item["spec_str"]
+                            retries = shared["retry_count"].get(spec_str, 0)
+                            if retries < 1:
+                                shared["retry_count"][spec_str] = retries + 1
+                                shared["last_gx_error"][spec_str] = f"{type(e).__name__}: {str(e)}"
+                                shared["tracker"][spec_str]["GX"] = "🚨 Error (Retrying AI...)"
+                                shared["queue"].insert(0, spec_str)
+                            else:
+                                tb_str = traceback.format_exc()
+                                error_msg = f"{type(e).__name__}: {str(e)}"
+                                shared["tracker"][spec_str]["GX"] = "🚨 Error"
+                                shared["tracker"][spec_str]["Result"] = f"🚨 Error: {type(e).__name__}"
+                                
+                                error_run_id = str(uuid.uuid4())
+                                error_log_data = {
+                                    "status": "ERROR", "error_message": error_msg, "traceback": tb_str, "failed_at_suite": suite_name
+                                }
+                                # ✅ [ AUTOMATE ERROR ]: Descriptive naming
+                                safe_ev = str(spec.get('event type', 'error')).replace('/', '_')
+                                safe_plc = str(spec.get('placement_id', 'unknown')).replace('/', '_')
+                                error_short_id = error_run_id[:8]
+                                batch_id_disp = spec.get('batch_id', 'nobatch')
+                                log_filename = f"run_{batch_id_disp}_{safe_ev}_{safe_plc}_{error_short_id}.json"
+                                log_filepath = os.path.join(LOGS_DIR, log_filename)
+                                error_run_data["log_filepath"] = log_filepath
+                                with open(log_filepath, 'w', encoding='utf-8') as f: json.dump(error_log_data, f, indent=4)
+                                
+                                run_data = {
+                                    "id": error_run_id, "name": suite_name,
+                                    "ev_type": ev_type, "plc_id": plc_id,
+                                    "status": "ERROR", "error": error_msg, "traceback": tb_str,
+                                    "spec_str": spec_str, "validation_process_log": [f"🚨 Exception: {error_msg}"]
+                                }
+                                shared["gx_results"].append(run_data)
+                            shared["gx_active_count"] -= 1
+                        time.sleep(1)
+
+            # เริ่มสั่ง Thread หลังบ้าน (DB Checker, AI, และ 3 GX)
             t1 = threading.Thread(target=db_checker_worker, args=(
                 st.session_state.selected_spec_strings, 
                 st.session_state.sql_config, 
@@ -1506,6 +1667,13 @@ def bulk_validation_ui():
             ))
             t1.start()
             t2.start()
+            for _ in range(3):
+                threading.Thread(target=gx_worker, args=(
+                    st.session_state.shared_state,
+                    (st.session_state.val_params["date"], st.session_state.val_params["segments"]),
+                    st.session_state.sql_config,
+                    DB_CONFIG
+                )).start()
             st.rerun()
 
         # =======================================================
@@ -1536,122 +1704,62 @@ def bulk_validation_ui():
                     ev, plc = spec_str.split(" | ")
                     st.button(f"📄 {ev} / {plc}", on_click=open_report_in_browser, args=[docs_url], key=f"tracker_docs_{i}", use_container_width=True)
 
-        # ดึงคิวจาก AI Queue มาทำ GX (ถ้ามี)
-        if len(shared["ai_queue"]) > 0:
-            item = shared["ai_queue"].pop(0)
-            spec_str = item["spec_str"]
-            ev_type = item["ev_type"]
-            plc_id = item["plc_id"]
-            suite_name = item["suite_name"]
-            final_expectations = item["expectations"]
-            flatten_map = item["flatten_map"]
-            prompt = item["prompt"]
+        # ดึงผลลัพธ์จาก GX Worker ใน GX Results Queue มาอัพเดท UI
+        if len(shared["gx_results"]) > 0:
+            run_data = shared["gx_results"].pop(0)
+            spec_str = run_data.get("spec_str")
             
-            with st.status(f"📊 GX: กำลังตรวจ Data `{ev_type}` ({plc_id})", expanded=True) as status:
-                try:
-                    shared["tracker"][spec_str]["GX"] = "🔄 รันตรวจ Data..."
-                    
-                    status.write(f"📊 นำกฏไปตรวจสอบ Data จริง (GX)...")
-                    val_params_tuple = (st.session_state.val_params["date"], st.session_state.val_params["segments"])
-                    
-                    sql_cfg = st.session_state.sql_config
-                    base_sql = ""
-                    if sql_cfg["source"] == "Select Existing SQL File":
-                        with open(os.path.join(SQL_DIR, sql_cfg["file"]), 'r', encoding='utf-8') as f: base_sql = f.read()
-                    else:
-                        base_sql = sql_cfg["custom_sql"]
-                    final_sql = prepare_spec_sql(base_sql, ev_type, plc_id)
+            if "log_data" in run_data:
+                # ✅ [ AUTOMATE SUCCESS ]: Descriptive naming
+                safe_ev = str(run_data.get('ev_type', 'unknown')).replace('/', '_')
+                safe_plc = str(run_data.get('plc_id', 'unknown')).replace('/', '_')
+                run_short_id = run_data.get('id', 'unknown')[:8]
+                batch_id_disp = run_data.get('batch_id', 'nobatch')
+                log_filename = f"run_{batch_id_disp}_{safe_ev}_{safe_plc}_{run_short_id}.json"
+                log_filepath = os.path.join(LOGS_DIR, log_filename)
+                
+                run_data["log_filepath"] = log_filepath # Save it so Waive Rules UI can find it later
+                with open(log_filepath, 'w', encoding='utf-8') as f: json.dump(run_data['log_data'], f, indent=4)
+            
+            st.session_state.history.insert(0, run_data)
+            st.session_state.overall_results.append(run_data)
 
-                    checkpoint_result, data_samples, docs_info, process_log, run_name, docs_error = run_validation_process(final_sql, final_expectations, suite_name, DB_CONFIG, val_params_tuple, flatten_map=flatten_map, batch_id=shared.get("batch_id"))
-                    
-                    run_id = str(uuid.uuid4())
-                    
-                    # หา docs URL ที่ชี้ไปผลรันเฉพาะ (segment URL)
-                    _docs_segs = (docs_info or {}).get("segments", {})
-                    best_docs_url = list(_docs_segs.values())[0] if _docs_segs else (docs_info or {}).get("local_path", "")
-                    
-                    run_data = {
-                        "id": run_id, "name": suite_name, "timestamp": datetime.datetime.now().isoformat(),
-                        "ev_type": ev_type, "plc_id": plc_id,
-                        "status": "SUCCESS" if checkpoint_result and checkpoint_result.success else ("ERROR" if checkpoint_result is None else "FAILURE"),
-                        "run_name": run_name, "batch_id": shared.get("batch_id", ""),
-                        "checkpoint_result": checkpoint_result, "data_samples": data_samples, "docs": docs_info,
-                        "docs_url": best_docs_url,
-                        "log_data": checkpoint_result.to_json_dict() if checkpoint_result else {"error": "Process failed or returned empty data"},
-                        "validation_process_log": process_log, "docs_error": docs_error,
-                        "ai_prompt": prompt, "ai_response": item.get("ai_response", "")
-                    }
-                    
-                    log_filepath = os.path.join(LOGS_DIR, f"run-{run_id}.json")
-                    with open(log_filepath, 'w', encoding='utf-8') as f: json.dump(run_data['log_data'], f, indent=4)
-                    
-                    st.session_state.history.insert(0, run_data)
-                    st.session_state.overall_results.append(run_data)
-
-                    # สรุปผล pass/fail จาก checkpoint
-                    if checkpoint_result:
-                        total_expectations = 0
-                        passed_expectations = 0
-                        for _, vr_dict in checkpoint_result.run_results.items():
-                            for result in vr_dict['validation_result'].results:
-                                total_expectations += 1
-                                if result.success:
-                                    passed_expectations += 1
-                        pct = round(passed_expectations / total_expectations * 100) if total_expectations > 0 else 0
-                        shared["tracker"][spec_str]["Pass/Fail"] = f"{passed_expectations}/{total_expectations} ({pct}%)"
-                    
-                    if not checkpoint_result:
-                        shared["tracker"][spec_str]["GX"] = "🚨 Error"
-                    else:
-                        shared["tracker"][spec_str]["GX"] = "✅ Done"
-                    
-                    # Data Docs link
-                    docs_segments = (docs_info or {}).get("segments", {})
-                    if docs_segments:
-                        docs_url = list(docs_segments.values())[0]
-                    else:
-                        docs_url = (docs_info or {}).get("local_path", "")
-                    if docs_url:
-                        shared["tracker"][spec_str]["Docs"] = docs_url
-                    
-                    if run_data['status'] == "SUCCESS":
-                        shared["tracker"][spec_str]["Result"] = "✅ Passed"
-                    elif run_data['status'] == "ERROR":
-                        shared["tracker"][spec_str]["Result"] = "🚨 Error"
-                    else:
-                        shared["tracker"][spec_str]["Result"] = "❌ Mismatch"
-
-                except Exception as e: 
-                    tb_str = traceback.format_exc()
-                    error_msg = f"{type(e).__name__}: {str(e)}"
+            if run_data.get('status') == "ERROR":
+                pass # Already set in worker if Exception, otherwise set below
+            else:
+                checkpoint_result = run_data.get('checkpoint_result')
+                if checkpoint_result:
+                    total_expectations = 0
+                    passed_expectations = 0
+                    for _, vr_dict in checkpoint_result.run_results.items():
+                        for result in vr_dict['validation_result'].results:
+                            total_expectations += 1
+                            if result.success:
+                                passed_expectations += 1
+                    pct = round(passed_expectations / total_expectations * 100) if total_expectations > 0 else 0
+                    shared["tracker"][spec_str]["Pass/Fail"] = f"{passed_expectations}/{total_expectations} ({pct}%)"
+                    shared["tracker"][spec_str]["GX"] = "✅ Done"
+                else:
                     shared["tracker"][spec_str]["GX"] = "🚨 Error"
-                    shared["tracker"][spec_str]["Result"] = f"🚨 Error: {type(e).__name__}"
-                    
-                    error_run_id = str(uuid.uuid4())
-                    error_log_data = {
-                        "status": "ERROR", 
-                        "error_message": error_msg, 
-                        "traceback": tb_str,
-                        "failed_at_suite": suite_name
-                    }
-                    log_filepath = os.path.join(LOGS_DIR, f"run-error-{error_run_id}.json")
-                    with open(log_filepath, 'w', encoding='utf-8') as f: 
-                        json.dump(error_log_data, f, indent=4)
-                    
-                    st.session_state.overall_results.append({
-                        "id": error_run_id, 
-                        "name": suite_name,
-                        "ev_type": ev_type, "plc_id": plc_id,
-                        "status": "ERROR",
-                        "error": error_msg,
-                        "traceback": tb_str
-                    })
+
+            docs_url = run_data.get("docs_url")
+            if docs_url:
+                shared["tracker"][spec_str]["Docs"] = docs_url
+            
+            if run_data['status'] == "SUCCESS":
+                shared["tracker"][spec_str]["Result"] = "✅ Passed"
+            elif run_data['status'] == "ERROR":
+                shared["tracker"][spec_str]["Result"] = "🚨 Error"
+            else:
+                shared["tracker"][spec_str]["Result"] = "❌ Mismatch"
                 
             st.rerun() 
             
-        elif not shared["ai_is_done"]:
-            with st.spinner("⏳ GX ว่างงาน: กำลังรอผลจาก AI Worker..."):
-                time.sleep(2)
+        elif not shared["ai_is_done"] or shared["gx_active_count"] > 0 or len(shared["ai_queue"]) > 0:
+            active = shared["gx_active_count"]
+            queued = len(shared["ai_queue"])
+            with st.spinner(f"⏳ กำลังรัน: AI Queue = {queued}, GX Active = {active}"):
+                time.sleep(1)
                 st.rerun()
                 
         else:
