@@ -210,6 +210,68 @@ def render_waive_ui(batch):
         
         editor_key = f"waive_editor_{batch.get('id', 'temp')}"
         
+        # --- สร้างฟังก์ชัน Callback สำหรับจัดการ State ทันทีก่อนที่จอจะ Rerun ---
+        def process_waive_submission(edited_data, current_batch, failed_items):
+            try:
+                # สร้าง mapping จาก rule_key ไปหา original expectation type
+                rule_key_to_original_type = {
+                    item["rule_key"]: item.get("exp_type_original", "") 
+                    for item in failed_items
+                }
+                
+                current_waives = set()
+                structured_waives = []
+                
+                for idx, row in edited_data.iterrows():
+                    if row["Waive"]:
+                        rule_key = f"{row['Column']} ({row['Rule']})"
+                        current_waives.add(rule_key)
+                        structured_waives.append({
+                            "column": row['Column'],
+                            "short_rule": row['Rule'],
+                            "expectation_type": rule_key_to_original_type.get(rule_key, ""),
+                            "rule_key": rule_key
+                        })
+                        
+                current_batch["waived_rules"] = current_waives
+                
+                # เซฟลง JSON
+                for run in current_batch.get("results", []):
+                    if "log_filepath" in run and os.path.exists(run["log_filepath"]):
+                        try:
+                            with open(run["log_filepath"], 'r', encoding='utf-8') as f:
+                                log_data = json.load(f)
+                            log_data["waived_rules"] = structured_waives
+                            with open(run["log_filepath"], 'w', encoding='utf-8') as f:
+                                json.dump(log_data, f, indent=4)
+                        except Exception as json_err:
+                            st.warning(f"⚠️ Could not update waived_rules: {json_err}")
+                
+                # Update History
+                for h_batch in st.session_state.history_batches:
+                    if h_batch.get("id") == current_batch.get("id"):
+                        h_batch["waived_rules"] = current_waives
+                        break
+
+                # Generate PDF
+                pdf_path = generate_batch_report_pdf(current_batch, current_batch["waived_rules"])
+                if pdf_path:
+                    current_batch["pdf_path"] = pdf_path
+                    for h_batch in st.session_state.history_batches:
+                        if h_batch.get("id") == current_batch.get("id"):
+                            h_batch["pdf_path"] = pdf_path
+                            break
+                            
+            except Exception as e:
+                current_batch["pdf_error"] = str(e)
+
+            # ล็อค State ให้แน่นก่อน Rerun
+            st.session_state.stage = "results_done" if st.session_state.stage != "history_view" else "history_view"
+            st.session_state.viewing_batch = current_batch
+            st.session_state.waive_success_msg = "✅ ยกเว้น Rule สำเร็จและผูกเข้าไฟล์ Log / PDF เรียบร้อย!"
+
+        # -------------------------------------------------------------
+        
         with st.form(key=f"waive_form_{batch.get('id', 'temp')}", border=True):
             edited_df = st.data_editor(
                 df_summary[["Waive", "Column", "Rule", "Details", "Errors", "Impacted Placements"]],
@@ -224,55 +286,15 @@ def render_waive_ui(batch):
             
             submit_waive = st.form_submit_button("✅ 1. Confirm Waived Rules & Regenerate Report", type="primary")
             if submit_waive:
-                # สร้าง mapping จาก rule_key ไปหา original expectation type
-                rule_key_to_original_type = {
-                    item["rule_key"]: item.get("exp_type_original", "") 
-                    for item in all_failed_items
-                }
-                
-                current_waives = set()
-                structured_waives = [] # อันนี้สำหรับเซฟลง JSON ให้ Web App อื่นอ่านง่ายขึ้น
-
-                for idx, row in edited_df.iterrows():
-                    if row["Waive"]:
-                        rule_key = f"{row['Column']} ({row['Rule']})"
-                        current_waives.add(rule_key)
-                        
-                        structured_waives.append({
-                            "column": row['Column'],
-                            "short_rule": row['Rule'],
-                            "expectation_type": rule_key_to_original_type.get(rule_key, ""),
-                            "rule_key": rule_key
-                        })
-                        
-                batch["waived_rules"] = current_waives
-                
-                try:
-                    # ✅ [ NEW ] เซฟ waived_rules กลับเข้าไปในไฟล์ JSON ของแต่ละ run ใน Batch
-                    for run in batch.get("results", []):
-                        if "log_filepath" in run and os.path.exists(run["log_filepath"]):
-                            try:
-                                with open(run["log_filepath"], 'r', encoding='utf-8') as f:
-                                    log_data = json.load(f)
-                                
-                                # อัปเดตข้อมูลแบบ Structured JSON เข้าไปใน log_data
-                                log_data["waived_rules"] = structured_waives
-                                
-                                with open(run["log_filepath"], 'w', encoding='utf-8') as f:
-                                    json.dump(log_data, f, indent=4)
-                            except Exception as json_err:
-                                st.warning(f"⚠️ Could not update waived_rules in log file {run['log_filepath']}: {json_err}")
-                    
-                    pdf_path = generate_batch_report_pdf(batch, batch["waived_rules"])
-                    batch["pdf_path"] = pdf_path
-                except Exception as e:
-                    batch["pdf_error"] = str(e)
-                    
-                st.session_state.stage = "results_done"
-                st.session_state.viewing_batch = batch
+                process_waive_submission(edited_df, batch, all_failed_items)
                 st.rerun()
                 
-        # Move PDF Download here, right below the form
+        # แสดงข้อความสำเร็จ (ถ้ามีเก็บไว้ใน state จากรอบก่อน)
+        if st.session_state.get("waive_success_msg"):
+            st.success(st.session_state.waive_success_msg)
+            st.session_state.waive_success_msg = "" # ล้างทิ้งหลังโชว์เสร็จ
+            
+    if "pdf_path" in batch: # Move PDF Download here, right below the form
         if batch.get("pdf_path") and os.path.exists(batch["pdf_path"]):
             with open(batch["pdf_path"], "rb") as f:
                 pdf_bytes = f.read()
@@ -1640,7 +1662,7 @@ def bulk_validation_ui():
                                 batch_id_disp = spec.get('batch_id', 'nobatch')
                                 log_filename = f"run_{batch_id_disp}_{safe_ev}_{safe_plc}_{error_short_id}.json"
                                 log_filepath = os.path.join(LOGS_DIR, log_filename)
-                                error_run_data["log_filepath"] = log_filepath
+                                error_log_data["log_filepath"] = log_filepath
                                 with open(log_filepath, 'w', encoding='utf-8') as f: json.dump(error_log_data, f, indent=4)
                                 
                                 run_data = {
@@ -1682,6 +1704,11 @@ def bulk_validation_ui():
         st.markdown(f"### 🚀 Pipeline ({len(st.session_state.selected_spec_strings)} คิว)")
         
         shared = st.session_state.shared_state 
+        
+        processing_active = not shared["is_done"] or shared["gx_active_count"] > 0 or len(shared["gx_results"]) > 0
+        
+        if processing_active:
+            st.spinner("⏳ กำลังตรวจสอบคุณภาพข้อมูล... กรุณารอจนกว่าจะเสร็จสิ้น")
         
         # Status bar
         if not shared["is_done"]:
@@ -1868,6 +1895,7 @@ def bulk_validation_ui():
             
             del st.session_state.pipeline_init
             st.session_state.stage = "results_done"
+            st.session_state.viewing_batch = st.session_state.get("current_batch")
             
             if st.button("🔄 โหลด Spec ใหม่ / เริ่มรันวันอื่น", use_container_width=True):
                 st.session_state.stage = "awaiting_spec"
